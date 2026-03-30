@@ -52,15 +52,15 @@ With input *"This restaurant has the best pasta I have ever tasted"*:
 
 | Layer | Alpha | Output |
 |---|---|---|
-| 0 | 1.0 | "I'm sorry, but as an AI language model..." (unchanged) |
-| 8 | 1.0 | "That's amazing! It sounds like you had an exceptional..." (slightly shifted) |
-| 12 | 1.0 | "this restaurant has the best pasta I have..." (echoing) |
-| 16 | 1.0 | "best pasta." (format shifting) |
-| 18 | 1.0 | **"positive"** (correct label) |
-| 22 | 0.5 | **"positive"** (correct label) |
-| 22 | 1.5 | "neutral" (over-steered) |
+| 0 | 1.0 | "I'm sorry, but as an AI language model, I don't have access..." (unchanged) |
+| 8 | 1.0 | "That's amazing! It sounds like you had an exceptional experience..." (slightly shifted) |
+| 12 | 1.0 | "This restaurant has the best pasta I have ever tasted in my life" (echoing input) |
+| 16 | 1.0 | "best pasta." (format shifting — terse, no longer conversational) |
+| 18 | 1.0 | **"positive"** (correct single-word label) |
+| 22 | 0.5 | "I'm happy to help! However, I need more information..." (still conversational) |
+| 22 | 1.5 | "neutralneutralneutral..." (over-steered, degenerate repetition) |
 
-The transition from verbose prose to single-word labels happens sharply at layers 16-18 (67-75% depth in the 24-layer model).
+The transition from verbose prose to single-word labels happens sharply at layers 16-18 (67-75% depth in the 24-layer model). Layer 22 at alpha=0.5 is too weak to flip the format; at alpha=1.5 it overshoots into degenerate repetition. The sweet spot is narrow.
 
 ## The Core Idea
 
