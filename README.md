@@ -8,28 +8,48 @@ Idea originally posed by **Noah Vandal** in the [DSPy Discord](https://discord.g
 
 ## Does it work?
 
-**Short answer: the concept is validated, but the performance gap is too large for practical use today.**
+**It depends on the task. For binary classification, yes — 94% accuracy with zero task-specific prompt tokens. For multi-class with an "absence" category (like neutral), no.**
 
-The core intuition is correct — prompts DO create measurable, consistent directions in activation space (cosine similarity >0.93 across all layers). A single 896-float vector CAN flip a model from verbose "I'm sorry, but as an AI..." prose to outputting single-word classification labels. That behavioral shift from a fixed-size vector is real and striking.
+The core intuition is correct — prompts DO create measurable, consistent directions in activation space (cosine similarity >0.93 across all layers). A single 896-float vector CAN flip a model from verbose "I'm sorry, but as an AI..." prose to outputting single-word classification labels. That behavioral shift from a fixed-size vector is real.
 
-But 65% vs 90% is not comparable performance. The steering vector alone recovers ~72% of the full prompt's accuracy, and the remaining gap is fundamental to the approach, not a tuning issue.
+### Binary classification: it works (94% vs 100%)
+
+On a 50-train / 50-test binary sentiment task (positive vs negative):
+
+| Condition | Overall | Positive | Negative | Tokens |
+|---|---|---|---|---|
+| Full prompt (78 tokens) | **100%** | 100% | 100% | 78 |
+| No prompt (baseline) | **0%** | 0% | 0% | 6 |
+| **Steering vector only** | **94%** | **100%** | **88%** | 6 + vector |
+
+The steering vector at layer 18 takes the model from 0% to **94%** with zero task-specific prompt tokens. Only 3 errors out of 50, all format failures (garbled partial echoes) rather than wrong classifications. The polarity signal transfers almost perfectly because positive-vs-negative maps to a single linear axis in activation space — exactly what a vector addition can represent.
+
+### Three-class with neutral: it doesn't work (65% vs 90%)
+
+When you add a "neutral" class, accuracy drops to 65%. The per-class breakdown reveals why:
+
+| Condition | Positive (8) | Negative (7) | Neutral (5) |
+|---|---|---|---|
+| Full Prompt | 8/8 | 7/7 | 3/5 |
+| Steered L18 | 8/8 | 5/7 | **0/5** |
+
+Neutral fails completely. The averaged vector has a polarity bias — positive and negative training examples don't average to "neutral," they average to "has strong sentiment." A single vector can't represent the *absence* of a direction.
 
 ### What works
 
-- **Prompts push activations in a consistent direction.** Cosine similarity >0.93 at every layer across diverse inputs. This means the prompt creates nearly the same activation-space shift regardless of input content — exactly what you'd need for a vector replacement to be viable.
-- **A single vector can change output format.** The model goes from multi-sentence conversational responses to single-word labels. At layer 18 the transition is sharp and clean.
-- **Positive and negative classification transfers well.** The steering vector gets positive 8/8 and negative 5/7 — the polarity signal is clearly captured.
+- **Prompts push activations in a consistent direction.** Cosine similarity >0.93 at every layer across diverse inputs. The prompt creates nearly the same activation-space shift regardless of input content.
+- **A single vector can change output format.** The model goes from multi-sentence conversational responses to single-word labels. At layer 18 the transition is sharp.
+- **Binary polarity transfers well.** Positive/negative is a natural single-axis concept that maps cleanly to a vector direction.
 
 ### What doesn't work
 
-- **65% vs 90% is a real gap.** The steering vector misses a quarter of the full prompt's accuracy. This isn't a tuning issue — it's structural.
-- **Neutral class completely fails (0/5).** The averaged vector has a polarity bias. Positive and negative training examples don't average to "neutral" — they average to "has strong sentiment." The vector can't represent absence of polarity.
-- **The alpha window is razor-thin.** At layer 18: alpha=0.9 gives 70%, alpha=1.0 gives 65%, alpha=1.5 gives degenerate repetition. There is no comfortable operating range — you're always one small perturbation from either "not enough effect" or gibberish.
-- **The hybrid result (85%) is misleading.** "Classify sentiment." alone gets 80%. The steering vector only adds 5 points. The short prompt is doing the real work, not the vector. If you can write a better short prompt, you don't need steering at all.
+- **Multi-class with "absence" categories.** Neutral, "none of the above," or any class defined by the lack of a signal can't be captured as a vector direction.
+- **The alpha window is narrow.** At layer 18: alpha=0.9 gives 86%, alpha=1.0 gives 94%, alpha=1.5 gives degenerate repetition. Neighboring layers (17, 19) are significantly worse. There's maybe a 0.3-unit operating range.
+- **Negative class is harder than positive.** Even in the binary task, negative gets 88% vs positive 100%. The 3 failures are all negative examples where the model produces garbled echoes instead of labels — the vector partially steers toward "label mode" but doesn't fully override the conversational mode for every input.
 
 ### Why the gap exists
 
-A static vector adds the same perturbation regardless of input. But the prompt effect is context-dependent. When the model reads "Respond with EXACTLY one word: positive, negative, or neutral," it dynamically applies different reasoning to "I love this" vs "I hate this" vs "It was fine." A fixed vector can't do that — it's the difference between a constant offset and a learned function.
+A static vector adds the same perturbation regardless of input. But the prompt effect is context-dependent. When the model reads "Respond with EXACTLY one word: positive or negative," it dynamically applies different reasoning to "I love this" vs "I hate this." A fixed vector can't do that — it's the difference between a constant offset and a learned function. For binary polarity the constant offset happens to be close enough. For tasks requiring more nuance, it's not.
 
 ## Results
 
@@ -42,6 +62,16 @@ Using **Qwen2.5-0.5B-Instruct** on a 20-example sentiment classification task:
 | C. Steering vector only (no task prompt) | **65%** | 6 | + 3.5KB vector |
 | D. Hybrid: 4-token prompt + steering vector | **85%** | 4 | + 3.5KB vector |
 | E. 4-token prompt alone | **80%** | 4 | - |
+
+### Binary sentiment (50 train / 50 test)
+
+| Condition | Overall | Positive (25) | Negative (25) | Tokens |
+|---|---|---|---|---|
+| Full prompt | **100%** | 100% | 100% | 78 |
+| No prompt (baseline) | **0%** | 0% | 0% | 6 |
+| Steering vector only (L18 α=1.0) | **94%** | **100%** | **88%** | 6 + vector |
+
+3 errors out of 50 — all format failures on negative examples (garbled partial echoes), not wrong classifications.
 
 ### Activation consistency by layer
 
@@ -110,9 +140,10 @@ uv run python experiment_final.py --model HuggingFaceTB/SmolLM2-135M-Instruct
 ## Architecture
 
 ```
-nnsight_lm.py       — NNsight model wrapper with activation extraction and forward-hook steering
-steering.py         — Steering vector computation, evaluation, and analysis
-experiment_final.py — Main experiment with concrete inputs/outputs at every stage
+nnsight_lm.py        — NNsight model wrapper with activation extraction and forward-hook steering
+steering.py          — Steering vector computation, evaluation, and analysis
+experiment_final.py  — Three-class experiment with concrete inputs/outputs at every stage
+experiment_binary.py — Binary classification experiment (50 train / 50 test)
 ```
 
 ### How it works
