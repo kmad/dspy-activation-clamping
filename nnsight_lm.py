@@ -1,16 +1,18 @@
 """
 Custom DSPy LM that wraps a HuggingFace model via nnsight.
-Supports both normal generation AND activation recording/injection.
+Supports normal generation, activation recording, steering injection,
+and continuation scoring for strict classification-style evaluation.
 """
 
-import torch
+from contextlib import contextmanager
+from dataclasses import dataclass
 import time
 import uuid
-import datetime
-from dataclasses import dataclass
+
+import torch
+from dspy.clients.base_lm import BaseLM
 from nnsight import LanguageModel
 from transformers import AutoTokenizer
-from dspy.clients.base_lm import BaseLM
 
 
 # Minimal OpenAI-compatible response objects for DSPy
@@ -53,13 +55,23 @@ class NNsightLM:
     Core model wrapper: HuggingFace model via nnsight for activation access.
     """
 
-    def __init__(self, model_name: str, device: str = "mps", max_new_tokens: int = 256):
+    def __init__(
+        self,
+        model_name: str,
+        device: str = "auto",
+        max_new_tokens: int = 256,
+        local_files_only: bool = False,
+    ):
         self.model_name = model_name
-        self.device = device
+        self.device = self._resolve_device(device)
         self.max_new_tokens = max_new_tokens
+        self.local_files_only = local_files_only
 
         print(f"Loading {model_name}...")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            local_files_only=local_files_only,
+        )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -72,6 +84,16 @@ class NNsightLM:
 
         self._detect_architecture()
         print(f"Loaded. {self.num_layers} layers, hidden_dim={self.hidden_dim}")
+
+    def _resolve_device(self, device: str) -> str:
+        if device != "auto":
+            return device
+
+        if torch.cuda.is_available():
+            return "cuda"
+        if torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
 
     def _detect_architecture(self):
         """Detect transformer block path for different architectures."""
@@ -92,14 +114,84 @@ class NNsightLM:
         """Get the nnsight Envoy for a specific transformer layer."""
         return self.model.get(f"{self.layer_path}.{idx}")
 
-    def generate_text(self, messages: list[dict], max_new_tokens: int | None = None) -> str:
-        """Generate text from chat messages."""
-        max_new_tokens = max_new_tokens or self.max_new_tokens
-
+    def _build_prompt(self, messages: list[dict]) -> str:
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
-        input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
+        return prompt
+
+    def _encode_prompt(self, messages: list[dict]) -> torch.Tensor:
+        prompt = self._build_prompt(messages)
+        return self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
+
+    @contextmanager
+    def _steering_hooks(
+        self,
+        steering_vectors: dict[int, torch.Tensor] | None,
+        alpha: float,
+        token_strategy: str,
+    ):
+        if not steering_vectors:
+            yield
+            return
+
+        if token_strategy not in {"all", "last"}:
+            raise ValueError(f"Unsupported token_strategy: {token_strategy}")
+
+        handles = []
+        inner = self.model._model
+
+        parts = self.layer_path.split(".")
+        module = inner
+        for part in parts:
+            module = getattr(module, part)
+
+        for layer_idx, vec in steering_vectors.items():
+            layer_module = module[layer_idx]
+            vec_device = vec.to(self.device)
+
+            def make_hook(v, a, strategy):
+                def hook(_module, _input, output):
+                    if isinstance(output, tuple):
+                        hidden_states = output[0]
+                        rest = output[1:]
+                    else:
+                        hidden_states = output
+                        rest = ()
+
+                    steer = (a * v).to(
+                        device=hidden_states.device,
+                        dtype=hidden_states.dtype,
+                    )
+
+                    if strategy == "all":
+                        steered = hidden_states + steer.view(1, 1, -1)
+                    else:
+                        steered = hidden_states.clone()
+                        steered[:, -1, :] = steered[:, -1, :] + steer.view(1, -1)
+
+                    if isinstance(output, tuple):
+                        return (steered,) + rest
+                    return steered
+
+                return hook
+
+            handles.append(
+                layer_module.register_forward_hook(
+                    make_hook(vec_device, alpha, token_strategy)
+                )
+            )
+
+        try:
+            yield
+        finally:
+            for handle in handles:
+                handle.remove()
+
+    def generate_text(self, messages: list[dict], max_new_tokens: int | None = None) -> str:
+        """Generate text from chat messages."""
+        max_new_tokens = max_new_tokens or self.max_new_tokens
+        input_ids = self._encode_prompt(messages)
 
         with torch.no_grad():
             output_ids = self.model._model.generate(
@@ -120,9 +212,7 @@ class NNsightLM:
         if layers is None:
             layers = list(range(self.num_layers))
 
-        prompt = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+        prompt = self._build_prompt(messages)
 
         saved = {}
         with self.model.trace(prompt):
@@ -142,47 +232,16 @@ class NNsightLM:
         steering_vectors: dict[int, torch.Tensor],
         alpha: float = 1.0,
         max_new_tokens: int | None = None,
+        token_strategy: str = "all",
     ) -> str:
         """
         Generate text while injecting steering vectors at specified layers.
         Uses forward hooks to add the steering vector during each forward pass.
         """
         max_new_tokens = max_new_tokens or self.max_new_tokens
+        input_ids = self._encode_prompt(messages)
 
-        prompt = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
-
-        # Use PyTorch forward hooks directly for steering during generation
-        handles = []
-        inner = self.model._model
-
-        for layer_idx, vec in steering_vectors.items():
-            vec_device = vec.to(self.device)
-
-            # Get the actual nn.Module for this layer
-            parts = self.layer_path.split(".")
-            module = inner
-            for part in parts:
-                module = getattr(module, part)
-            layer_module = module[layer_idx]
-
-            def make_hook(v, a):
-                def hook(module, input, output):
-                    # output is typically (hidden_states, ...) tuple
-                    if isinstance(output, tuple):
-                        h = output[0]
-                        h = h + a * v
-                        return (h,) + output[1:]
-                    else:
-                        return output + a * v
-                return hook
-
-            handle = layer_module.register_forward_hook(make_hook(vec_device, alpha))
-            handles.append(handle)
-
-        try:
+        with self._steering_hooks(steering_vectors, alpha, token_strategy):
             with torch.no_grad():
                 output_ids = self.model._model.generate(
                     input_ids,
@@ -190,12 +249,54 @@ class NNsightLM:
                     do_sample=False,
                     pad_token_id=self.tokenizer.pad_token_id,
                 )
-        finally:
-            for h in handles:
-                h.remove()
 
         new_tokens = output_ids[0, input_ids.shape[1]:]
         return self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+    def score_continuations(
+        self,
+        messages: list[dict],
+        continuations: list[str],
+        steering_vectors: dict[int, torch.Tensor] | None = None,
+        alpha: float = 1.0,
+        token_strategy: str = "all",
+        normalize_by_length: bool = True,
+    ) -> dict[str, float]:
+        """
+        Score candidate continuations with summed token log-probabilities.
+
+        This is the primary evaluation path for rigorous classification tasks because
+        it isolates semantic preference from output-format failures.
+        """
+        prompt_ids = self._encode_prompt(messages)
+        prompt_len = prompt_ids.shape[1]
+        scores = {}
+
+        with self._steering_hooks(steering_vectors, alpha, token_strategy):
+            for continuation in continuations:
+                continuation_ids = self.tokenizer.encode(
+                    continuation,
+                    add_special_tokens=False,
+                    return_tensors="pt",
+                ).to(self.device)
+                input_ids = torch.cat([prompt_ids, continuation_ids], dim=1)
+
+                with torch.no_grad():
+                    logits = self.model._model(input_ids).logits[0]
+                    log_probs = torch.log_softmax(logits, dim=-1)
+
+                continuation_tokens = continuation_ids[0]
+                token_log_probs = []
+                for offset, token_id in enumerate(continuation_tokens):
+                    position = prompt_len - 1 + offset
+                    token_log_probs.append(log_probs[position, token_id].item())
+
+                score = sum(token_log_probs)
+                if normalize_by_length and token_log_probs:
+                    score /= len(token_log_probs)
+                scores[continuation] = score
+
+        return scores
 
 
 class NNsightDSPyLM(BaseLM):

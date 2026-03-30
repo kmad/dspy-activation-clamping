@@ -13,6 +13,7 @@ from pathlib import Path
 from nnsight_lm import NNsightLM, NNsightDSPyLM
 from steering import (
     extract_steering_vectors,
+    extract_steering_vectors_from_message_pairs,
     evaluate_steering,
     find_best_layer,
     build_messages,
@@ -198,11 +199,10 @@ def run_experiment(
     # Extract at all layers for analysis
     all_layers = list(range(lm.num_layers))
 
-    steering_result = extract_steering_vectors(
+    steering_result = extract_steering_vectors_from_message_pairs(
         lm,
-        inputs=extraction_inputs,
-        optimized_system_prompt=opt_system_prompt,
-        baseline_system_prompt=base_system_prompt,
+        optimized_messages=opt_activations_inputs,
+        baseline_messages=base_activations_inputs,
         layers=all_layers,
         token_aggregation="last",
     )

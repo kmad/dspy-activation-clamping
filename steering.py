@@ -34,6 +34,79 @@ def build_messages(system_prompt: str, user_content: str) -> list[dict]:
     return msgs
 
 
+def _aggregate_activation(hidden_states: torch.Tensor, token_aggregation: str) -> torch.Tensor:
+    """Aggregate a [seq_len, hidden] or [1, seq_len, hidden] activation tensor."""
+    if hidden_states.dim() == 3:
+        hidden_states = hidden_states[0]
+
+    if token_aggregation == "last":
+        return hidden_states[-1, :]
+    if token_aggregation == "mean":
+        return hidden_states.mean(dim=0)
+
+    raise ValueError(f"Unsupported aggregation: {token_aggregation}")
+
+
+def extract_steering_vectors_from_message_pairs(
+    lm: NNsightLM,
+    optimized_messages: list[list[dict]],
+    baseline_messages: list[list[dict]],
+    layers: list[int] | None = None,
+    token_aggregation: str = "last",
+) -> SteeringResult:
+    """
+    Extract steering vectors from exact optimized/baseline message traces.
+
+    This is the rigorous API for comparing DSPy programs or any other prompts where
+    the full message layout differs, not just the system prompt string.
+    """
+    if len(optimized_messages) != len(baseline_messages):
+        raise ValueError("optimized_messages and baseline_messages must have the same length")
+
+    if layers is None:
+        n = lm.num_layers
+        layers = [0, n // 4, n // 2, 3 * n // 4, n - 1]
+
+    diffs_per_layer: dict[int, list[torch.Tensor]] = {layer_idx: [] for layer_idx in layers}
+
+    for idx, (opt_msgs, base_msgs) in enumerate(zip(optimized_messages, baseline_messages)):
+        print(f"  Processing message pair {idx + 1}/{len(optimized_messages)}...")
+        opt_acts = lm.extract_activations(opt_msgs, layers)
+        base_acts = lm.extract_activations(base_msgs, layers)
+
+        for layer_idx in layers:
+            opt_vec = _aggregate_activation(opt_acts[layer_idx], token_aggregation)
+            base_vec = _aggregate_activation(base_acts[layer_idx], token_aggregation)
+            diffs_per_layer[layer_idx].append(opt_vec - base_vec)
+
+    vectors = {}
+    norms = {}
+    cosine_sims = {}
+
+    for layer_idx in layers:
+        diffs = torch.stack(diffs_per_layer[layer_idx])
+        mean_diff = diffs.mean(dim=0)
+        vectors[layer_idx] = mean_diff
+        norms[layer_idx] = mean_diff.norm().item()
+
+        if len(diffs) > 1:
+            normed = torch.nn.functional.normalize(diffs, dim=1)
+            sim_matrix = normed @ normed.T
+            n = len(diffs)
+            mask = ~torch.eye(n, dtype=torch.bool)
+            cosine_sims[layer_idx] = sim_matrix[mask].mean().item()
+        else:
+            cosine_sims[layer_idx] = 1.0
+
+    return SteeringResult(
+        vectors=vectors,
+        layers=layers,
+        num_samples=len(optimized_messages),
+        norms=norms,
+        cosine_similarities=cosine_sims,
+    )
+
+
 def extract_steering_vectors(
     lm: NNsightLM,
     inputs: list[str],
@@ -60,73 +133,20 @@ def extract_steering_vectors(
         # Sample key layers: early, middle, late
         n = lm.num_layers
         layers = [0, n // 4, n // 2, 3 * n // 4, n - 1]
-
-    # Collect per-sample activation differences
-    diffs_per_layer: dict[int, list[torch.Tensor]] = {l: [] for l in layers}
-
-    for i, user_input in enumerate(inputs):
-        print(f"  Processing input {i+1}/{len(inputs)}...")
-
-        # Get activations with optimized prompt
-        opt_messages = build_messages(optimized_system_prompt, user_input)
-        opt_acts = lm.extract_activations(opt_messages, layers)
-
-        # Get activations with baseline prompt
-        base_messages = build_messages(baseline_system_prompt, user_input)
-        base_acts = lm.extract_activations(base_messages, layers)
-
-        for layer_idx in layers:
-            opt_h = opt_acts[layer_idx]   # [seq_len, hidden] or [1, seq_len, hidden]
-            base_h = base_acts[layer_idx]
-
-            # Normalize to 2D [seq_len, hidden]
-            if opt_h.dim() == 3:
-                opt_h = opt_h[0]
-            if base_h.dim() == 3:
-                base_h = base_h[0]
-
-            if token_aggregation == "last":
-                opt_vec = opt_h[-1, :]    # [hidden]
-                base_vec = base_h[-1, :]  # [hidden]
-            elif token_aggregation == "mean":
-                opt_vec = opt_h.mean(dim=0)   # [hidden]
-                base_vec = base_h.mean(dim=0)  # [hidden]
-            else:
-                raise ValueError(f"Unsupported aggregation: {token_aggregation}")
-
-            diff = opt_vec - base_vec  # [hidden]
-            diffs_per_layer[layer_idx].append(diff)
-
-    # Compute mean steering vector per layer
-    vectors = {}
-    norms = {}
-    cosine_sims = {}
-
-    for layer_idx in layers:
-        diffs = torch.stack(diffs_per_layer[layer_idx])  # [num_samples, hidden]
-        mean_diff = diffs.mean(dim=0)  # [hidden]
-        vectors[layer_idx] = mean_diff
-        norms[layer_idx] = mean_diff.norm().item()
-
-        # Compute average pairwise cosine similarity of individual diffs
-        # (measures consistency: are all samples shifting in the same direction?)
-        if len(diffs) > 1:
-            normed = torch.nn.functional.normalize(diffs, dim=1)
-            sim_matrix = normed @ normed.T
-            # Average off-diagonal elements
-            n = len(diffs)
-            mask = ~torch.eye(n, dtype=torch.bool)
-            avg_sim = sim_matrix[mask].mean().item()
-            cosine_sims[layer_idx] = avg_sim
-        else:
-            cosine_sims[layer_idx] = 1.0
-
-    return SteeringResult(
-        vectors=vectors,
+    optimized_messages = [
+        build_messages(optimized_system_prompt, user_input)
+        for user_input in inputs
+    ]
+    baseline_messages = [
+        build_messages(baseline_system_prompt, user_input)
+        for user_input in inputs
+    ]
+    return extract_steering_vectors_from_message_pairs(
+        lm,
+        optimized_messages=optimized_messages,
+        baseline_messages=baseline_messages,
         layers=layers,
-        num_samples=len(inputs),
-        norms=norms,
-        cosine_similarities=cosine_sims,
+        token_aggregation=token_aggregation,
     )
 
 

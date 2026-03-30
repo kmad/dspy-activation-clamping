@@ -1,5 +1,20 @@
 # DSPy Activation Clamping: Experimental Findings
 
+> Note
+> These findings come from the earlier exploratory scripts in this repo.
+> For a defensible answer, use `experiment_rigorous.py`, which adds held-out
+> validation/test splits, strict scoring, and seeded repeats.
+
+## Rigorous Update
+
+The current repo-level conclusion is **not supported**:
+
+- steering alone does not match the full prompt on held-out evaluation
+- steering alone does not outperform the short hybrid prompt baseline
+- the strongest remaining signal is modest help with **formatting**, not semantics
+
+See `RESULTS_RIGOROUS.md` and `results_rigorous/results.json` for the canonical result.
+
 ## Core Hypothesis
 Can we extract the effect of a DSPy-optimized prompt as a steering vector in activation space, then reproduce that effect by injecting the vector WITHOUT the prompt — saving tokens and potentially TTFB?
 
